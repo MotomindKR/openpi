@@ -46,8 +46,8 @@ def make_attn_mask(input_mask, mask_ar):
 
 @at.typecheck
 def posemb_sincos(
-    pos: at.Real[at.Array, " b"], embedding_dim: int, min_period: float, max_period: float
-) -> at.Float[at.Array, "b {embedding_dim}"]:
+    pos: at.Real[at.Array, "*b"], embedding_dim: int, min_period: float, max_period: float
+) -> at.Float[at.Array, "*b {embedding_dim}"]:
     """Computes sine-cosine positional embedding vectors for scalar positions."""
     if embedding_dim % 2 != 0:
         raise ValueError(f"embedding_dim ({embedding_dim}) must be divisible by 2")
@@ -55,7 +55,7 @@ def posemb_sincos(
     fraction = jnp.linspace(0.0, 1.0, embedding_dim // 2)
     period = min_period * (max_period / min_period) ** fraction
     sinusoid_input = jnp.einsum(
-        "i,j->ij",
+        "...i,j->...ij",
         pos,
         1.0 / period * 2 * jnp.pi,
         precision=jax.lax.Precision.HIGHEST,
@@ -67,6 +67,7 @@ class Pi0(_model.BaseModel):
     def __init__(self, config: pi0_config.Pi0Config, rngs: nnx.Rngs):
         super().__init__(config.action_dim, config.action_horizon, config.max_token_len)
         self.pi05 = config.pi05
+        self.rtc_training_max_delay = config.rtc_training_max_delay
         paligemma_config = _gemma.get_config(config.paligemma_variant)
         action_expert_config = _gemma.get_config(config.action_expert_variant)
         # TODO: rewrite gemma in NNX. For now, use bridge.
@@ -138,12 +139,15 @@ class Pi0(_model.BaseModel):
 
     @at.typecheck
     def embed_suffix(
-        self, obs: _model.Observation, noisy_actions: _model.Actions, timestep: at.Float[at.Array, " b"]
+        self,
+        obs: _model.Observation,
+        noisy_actions: _model.Actions,
+        timestep: at.Float[at.Array, " b"] | at.Float[at.Array, "b ah"],
     ) -> tuple[
         at.Float[at.Array, "b s emb"],
         at.Bool[at.Array, "b s"],
         at.Bool[at.Array, " s"],
-        at.Float[at.Array, "b emb"] | None,
+        at.Float[at.Array, "b emb"] | at.Float[at.Array, "b ah emb"] | None,
     ]:
         input_mask = []
         ar_mask = []
@@ -195,7 +199,16 @@ class Pi0(_model.BaseModel):
         batch_shape = actions.shape[:-2]
         noise = jax.random.normal(noise_rng, actions.shape)
         time = jax.random.beta(time_rng, 1.5, 1, batch_shape) * 0.999 + 0.001
-        time_expanded = time[..., None, None]
+        if self.rtc_training_max_delay:
+            # Black et al. (2512.05964): expose clean ground-truth actions for
+            # the sampled latency prefix; denoise and supervise only the suffix.
+            delay_rng = jax.random.fold_in(time_rng, 1)
+            delay = jax.random.randint(delay_rng, batch_shape, 0, self.rtc_training_max_delay + 1)
+            prefix = jnp.arange(self.action_horizon) < delay[..., None]
+            time = jnp.where(prefix, 0.0, time[..., None])
+            time_expanded = time[..., None]
+        else:
+            time_expanded = time[..., None, None]
         x_t = time_expanded * noise + (1 - time_expanded) * actions
         u_t = noise - actions
 
@@ -206,12 +219,18 @@ class Pi0(_model.BaseModel):
         ar_mask = jnp.concatenate([prefix_ar_mask, suffix_ar_mask], axis=0)
         attn_mask = make_attn_mask(input_mask, ar_mask)
         positions = jnp.cumsum(input_mask, axis=1) - 1
-        (prefix_out, suffix_out), _ = self.PaliGemma.llm(
+        (_prefix_out, suffix_out), _ = self.PaliGemma.llm(
             [prefix_tokens, suffix_tokens], mask=attn_mask, positions=positions, adarms_cond=[None, adarms_cond]
         )
         v_t = self.action_out_proj(suffix_out[:, -self.action_horizon :])
 
-        return jnp.mean(jnp.square(v_t - u_t), axis=-1)
+        loss = jnp.mean(jnp.square(v_t - u_t), axis=-1)
+        if self.rtc_training_max_delay:
+            suffix = ~prefix
+            # train.py averages over both batch and horizon. Normalize each
+            # example by its supervised suffix, independent of sampled delay.
+            loss = loss * suffix * (self.action_horizon / jnp.sum(suffix, axis=-1, keepdims=True))
+        return loss
 
     @override
     def sample_actions(
@@ -271,7 +290,7 @@ class Pi0(_model.BaseModel):
             return x_t + dt * v_t, time + dt
 
         def cond(carry):
-            x_t, time = carry
+            _x_t, time = carry
             # robust to floating-point error
             return time >= -dt / 2
 

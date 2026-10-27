@@ -140,10 +140,19 @@ def create_torch_dataset(
     dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(repo_id)
     dataset = lerobot_dataset.LeRobotDataset(
         data_config.repo_id,
+        episodes=data_config.episodes,
         delta_timestamps={
             key: [t / dataset_meta.fps for t in range(action_horizon)] for key in data_config.action_sequence_keys
         },
     )
+    if data_config.episodes is not None:
+        # The pinned LeRobot reader indexes this table by the original episode ID,
+        # but builds it in selected-episode order. Keep video IDs unchanged and map
+        # only the temporal query boundaries back to their original IDs.
+        for key, offsets in dataset.episode_data_index.items():
+            indexed = torch.zeros(dataset_meta.total_episodes, dtype=offsets.dtype)
+            indexed[list(data_config.episodes)] = offsets
+            dataset.episode_data_index[key] = indexed
 
     if data_config.prompt_from_task:
         dataset = TransformedDataset(dataset, [_transforms.PromptFromLeRobotTask(dataset_meta.tasks)])

@@ -29,8 +29,8 @@ def create_sinusoidal_pos_embedding(
     if dimension % 2 != 0:
         raise ValueError(f"dimension ({dimension}) must be divisible by 2")
 
-    if time.ndim != 1:
-        raise ValueError("The time tensor is expected to be of shape `(batch_size, )`.")
+    if time.ndim not in (1, 2):
+        raise ValueError("Expected time shape (batch,) or (batch, action_horizon).")
 
     dtype = get_safe_dtype(torch.float64, device.type)
     fraction = torch.linspace(0.0, 1.0, dimension // 2, dtype=dtype, device=device)
@@ -38,8 +38,8 @@ def create_sinusoidal_pos_embedding(
 
     # Compute the outer product
     scaling_factor = 1.0 / period * 2 * math.pi
-    sin_input = scaling_factor[None, :] * time[:, None]
-    return torch.cat([torch.sin(sin_input), torch.cos(sin_input)], dim=1)
+    sin_input = scaling_factor * time[..., None]
+    return torch.cat([torch.sin(sin_input), torch.cos(sin_input)], dim=-1)
 
 
 def sample_beta(alpha, beta, bsize, device):
@@ -117,7 +117,7 @@ class PI0Pytorch(nn.Module):
 
         msg = "transformers_replace is not installed correctly. Please install it with `uv pip install transformers==4.53.2` and `cp -r ./src/openpi/models_pytorch/transformers_replace/* .venv/lib/python3.11/site-packages/transformers/`."
         try:
-            from transformers.models.siglip import check
+            from transformers.models.siglip import check  # noqa: PLC0415 -- deferred replacement check
 
             if not check.check_whether_transformers_replace_is_installed_correctly():
                 raise ValueError(msg)
