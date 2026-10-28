@@ -122,11 +122,18 @@ def init_train_state(
     partial_params = _load_weights_and_validate(config.weight_loader, train_state_shape.params.to_pure_dict())
     replicated_sharding = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec())
 
+    # Place checkpoint leaves in their final shards before initializing optimizer/EMA state.
+    param_layout = traverse_util.flatten_dict(state_sharding.params.to_pure_dict())
+    partial_layout = traverse_util.unflatten_dict(
+        {key: param_layout[key] for key in traverse_util.flatten_dict(partial_params)}
+    )
+    partial_params = jax.device_put(partial_params, partial_layout)
+
     # Initialize the train state and mix in the partial params.
     train_state = jax.jit(
         init,
         donate_argnums=(1,),  # donate the partial params buffer.
-        in_shardings=replicated_sharding,
+        in_shardings=(replicated_sharding, partial_layout),
         out_shardings=state_sharding,
     )(init_rng, partial_params)
 
